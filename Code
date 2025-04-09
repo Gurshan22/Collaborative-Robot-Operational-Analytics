@@ -1,0 +1,241 @@
+!pip install pyspark
+import pyspark
+print(pyspark.__version__)
+
+!apt-get update
+!apt-get install openjdk-11-jdk -y
+!java -version
+
+import os
+os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-11-openjdk-amd64"
+!echo $JAVA_HOME
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sum
+from pyspark.ml.feature import VectorAssembler, StandardScaler, PCA
+from pyspark.ml.regression import LinearRegression, RandomForestRegressor, GBTRegressor
+from pyspark.ml.clustering import KMeans, GaussianMixture
+from pyspark.ml.classification import LogisticRegression, RandomForestClassifier, DecisionTreeClassifier, GBTClassifier
+from pyspark.ml.evaluation import RegressionEvaluator, ClusteringEvaluator, BinaryClassificationEvaluator
+from pyspark.ml import Pipeline
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import roc_curve, auc as sklearn_auc
+
+# Initialize Spark session
+spark = SparkSession.builder.appName("CobotOpsAnalysis").getOrCreate()
+
+# Load the dataset
+df = spark.read.csv("/content/UR3 CobotOps Dataset.csv", header=True, inferSchema=True)
+print("Raw dataset sample:")
+df.show()
+
+# Select relevant features for analysis
+feature_columns = [
+    "Current_J0", "Temperature_T0", "Current_J1", "Temperature_J1",
+    "Current_J2", "Temperature_J2", "Current_J3", "Temperature_J3",
+    "Current_J4", "Temperature_J4", "Current_J5", "Temperature_J5",
+    "Speed_J0", "Speed_J1", "Speed_J2", "Speed_J3", "Speed_J4", "Speed_J5",
+    "Tool_current"
+]
+
+# Visualize feature distributions
+plt.figure(figsize=(20, 15))
+for i, feature in enumerate(feature_columns, 1):
+    plt.subplot(5, 4, i)
+    feature_data = df.select(feature).toPandas()[feature]
+    plt.hist(feature_data, bins=30, edgecolor='black')
+    plt.title(feature)
+    plt.xlabel('Value')
+    plt.ylabel('Frequency')
+plt.tight_layout()
+plt.suptitle('Feature Distributions', fontsize=16)
+plt.show()
+
+# Handle null values
+df = df.na.drop(subset=feature_columns)
+
+# Assemble features into a vector
+assembler = VectorAssembler(inputCols=feature_columns, outputCol="features")
+df = assembler.transform(df).filter(col("features").isNotNull())
+
+# Standardize the features
+scaler = StandardScaler(inputCol="features", outputCol="scaledFeatures", withStd=True, withMean=True)
+scaler_model = scaler.fit(df)
+df = scaler_model.transform(df)
+
+# 1. Regression Analysis
+print("\nRegression Analysis")
+train_data, test_data = df.randomSplit([0.8, 0.2], seed=42)
+
+# Multiple Regression Models
+regression_models = [
+    ("Linear Regression", LinearRegression(featuresCol="scaledFeatures", labelCol="Tool_current")),
+    ("Random Forest Regression", RandomForestRegressor(featuresCol="scaledFeatures", labelCol="Tool_current", seed=42)),
+    ("Gradient Boosted Trees", GBTRegressor(featuresCol="scaledFeatures", labelCol="Tool_current", seed=42))
+]
+
+regression_results = {}
+
+for name, model in regression_models:
+    # Train the model
+    model_instance = model.fit(train_data)
+    predictions = model_instance.transform(test_data)
+
+    # Evaluate the model
+    reg_evaluator = RegressionEvaluator(labelCol="Tool_current", predictionCol="prediction", metricName="rmse")
+    rmse = reg_evaluator.evaluate(predictions)
+    regression_results[name] = rmse
+
+    print(f"\n{name} RMSE: {rmse}")
+
+# Find the best regression model
+best_regression_model = min(regression_results, key=regression_results.get)
+print(f"\nBest Regression Model: {best_regression_model} with RMSE: {regression_results[best_regression_model]}")
+
+# Plot actual vs predicted values
+actual_vs_predicted = predictions.select("Tool_current", "prediction").toPandas()
+plt.figure(figsize=(8, 4))
+plt.scatter(actual_vs_predicted["Tool_current"], actual_vs_predicted["prediction"], alpha=0.5)
+plt.xlabel("Actual Tool Current")
+plt.ylabel("Predicted Tool Current")
+plt.title("Actual vs Predicted Tool Current")
+plt.show()
+
+# 2. Clustering Analysis
+print("\nClustering Analysis")
+
+# Multiple Clustering Models
+clustering_models = [
+    ("K-Means", KMeans(featuresCol="scaledFeatures", k=3, seed=42)),
+    ("Gaussian Mixture", GaussianMixture(featuresCol="scaledFeatures", k=3, seed=42))
+]
+
+clustering_results = {}
+
+for name, model in clustering_models:
+    # Train the model
+    model_instance = model.fit(df)
+    clustered_data = model_instance.transform(df)
+
+    # Evaluate the model
+    cluster_evaluator = ClusteringEvaluator()
+    silhouette = cluster_evaluator.evaluate(clustered_data)
+    clustering_results[name] = silhouette
+
+    print(f"\n{name} Silhouette Score: {silhouette}")
+
+# Find the best clustering model
+best_clustering_model = max(clustering_results, key=clustering_results.get)
+print(f"\nBest Clustering Model: {best_clustering_model} with Silhouette Score: {clustering_results[best_clustering_model]}")
+
+# Visualize clusters using PCA
+pca = PCA(k=2, inputCol="scaledFeatures", outputCol="pcaFeatures")
+pca_model = pca.fit(df)
+pca_data = pca_model.transform(df).select("pcaFeatures").toPandas()
+pca_data = np.array(pca_data["pcaFeatures"].tolist())
+
+plt.figure(figsize=(8, 4))
+plt.scatter(pca_data[:, 0], pca_data[:, 1], c=clustered_data.select("prediction").toPandas()["prediction"], cmap="viridis")
+plt.xlabel("PCA Feature 1")
+plt.ylabel("PCA Feature 2")
+plt.title("Clustering Visualization (k=3)")
+plt.colorbar(label="Cluster")
+plt.show()
+
+# 3. Classification Analysis
+print("\nClassification Analysis")
+df = df.withColumn("Robot_ProtectiveStop", col("Robot_ProtectiveStop").cast("integer"))
+train_data, test_data = df.randomSplit([0.8, 0.2], seed=42)
+
+# Multiple Classification Models
+classification_models = [
+    ("Logistic Regression", LogisticRegression(featuresCol="scaledFeatures", labelCol="Robot_ProtectiveStop")),
+    ("Random Forest", RandomForestClassifier(featuresCol="scaledFeatures", labelCol="Robot_ProtectiveStop", seed=42)),
+    ("Decision Tree", DecisionTreeClassifier(featuresCol="scaledFeatures", labelCol="Robot_ProtectiveStop", seed=42)),
+    ("Gradient Boosted Trees", GBTClassifier(featuresCol="scaledFeatures", labelCol="Robot_ProtectiveStop", seed=42))
+]
+
+classification_results = {}
+
+for name, model in classification_models:
+    # Train the model
+    model_instance = model.fit(train_data)
+    predictions = model_instance.transform(test_data)
+
+    # Evaluate the model
+    evaluator = BinaryClassificationEvaluator(
+        labelCol="Robot_ProtectiveStop",
+        rawPredictionCol="rawPrediction",
+        metricName="areaUnderROC"
+    )
+    auc = evaluator.evaluate(predictions)
+    classification_results[name] = auc
+
+    print(f"\n{name} AUC: {auc}")
+
+# Find the best classification model
+best_classification_model = max(classification_results, key=classification_results.get)
+print(f"\nBest Classification Model: {best_classification_model} with AUC: {classification_results[best_classification_model]}")
+
+# Plot ROC curve
+y_true = predictions.select("Robot_ProtectiveStop").toPandas()
+y_scores = predictions.select("rawPrediction").toPandas()["rawPrediction"].apply(lambda x: x[1])
+
+# Compute ROC curve and ROC area
+fpr, tpr, _ = roc_curve(y_true, y_scores)
+roc_auc = sklearn_auc(fpr, tpr)
+
+plt.figure(figsize=(8, 4))
+plt.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (area = {roc_auc:.2f})")
+plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve for Best Classification Model")
+plt.legend(loc="lower right")
+plt.show()
+
+# 4. Dimensionality Reduction
+print("\nDimensionality Reduction")
+
+# Compare PCA with different numbers of components
+pca_variants = [
+    ("PCA (2 Components)", 2),
+    ("PCA (3 Components)", 3),
+    ("PCA (5 Components)", 5)
+]
+
+for name, n_components in pca_variants:
+    print(f"\n{name}")
+    pca = PCA(k=n_components, inputCol="scaledFeatures", outputCol="pcaFeatures")
+
+    # Train the PCA model
+    pca_model = pca.fit(df)
+
+    # Transform the data
+    pca_transformed = pca_model.transform(df)
+
+    # Show the first few rows of transformed data
+    pca_transformed.select("pcaFeatures").show(5, truncate=False)
+
+    # Convert to numpy for visualization
+    pca_data_np = np.array(pca_transformed.select("pcaFeatures").toPandas()["pcaFeatures"].tolist())
+
+    # Visualize for 2-component PCA
+    if n_components == 2:
+        plt.figure(figsize=(10, 6))
+        plt.scatter(pca_data_np[:, 0], pca_data_np[:, 1], alpha=0.5)
+        plt.xlabel("PCA Feature 1")
+        plt.ylabel("PCA Feature 2")
+        plt.title(f"{name} - Transformed Data")
+        plt.tight_layout()
+        plt.show()
+
+# Optional: Print explained variance ratio
+print("\nExplained Variance Ratio:")
+explained_variance = pca_model.explainedVariance
+for i, var in enumerate(explained_variance, 1):
+    print(f"Component {i}: {var:.4f}")
+
+# Stop the Spark session
+spark.stop()
